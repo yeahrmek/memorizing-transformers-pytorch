@@ -1,10 +1,9 @@
 import os
-import math
 import torch
 import faiss
 import numpy as np
 from pathlib import Path
-from functools import wraps
+import pickle
 
 from contextlib import ExitStack, contextmanager
 
@@ -43,6 +42,41 @@ def multi_context(*cms):
 def count_intersect(x, y):
     # returns an array that shows how many times an element in x is contained in tensor y
     return np.sum(rearrange(x, 'i -> i 1') == rearrange(y, 'j -> 1 j'), axis = -1)
+
+
+class TensorTokenTable(object):
+    def __init__(self, filename):
+        self.filename = Path(filename)
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+
+        self._table = {}
+
+    def hash(self, tensor):
+        return hash(pickle.dumps(tensor))
+
+    def add(self, tensor, token):
+        self._table[self.hash(tensor)] = token
+
+    def get(self, tensor):
+        return self._table.get(self.hash(tensor), None)
+
+    def dump(self):
+        with open(self.filename, 'w') as f_handle:
+            dumps = '\n'.join([f"{key}: {val}" for key, val in self._table.items()])
+            f_handle.write(dumps)
+
+    def reset(self):
+        self._table = {}
+        with open(self.filename, 'w') as f_handle:
+            f_handle.write('')
+
+    def load(self):
+        self._table = {}
+        with open(self.filename, 'r') as f_handle:
+            for line in f_handle:
+                key, val = line.split(': ')
+                self._table[int(key.strip())] = val.strip()
+
 
 # a wrapper around faiss IndexIVFFlat
 # taking care of expiring old keys automagically
@@ -139,6 +173,7 @@ class KNNMemory():
         max_memories = 16000,
         num_indices = 1,
         memmap_filename = './knn.memory.memmap',
+        hashtable_filename = './knn.memory.hashtable',
         multiprocessing = True
     ):
         self.dim = dim
@@ -151,7 +186,9 @@ class KNNMemory():
 
         self.db = np.memmap(memmap_filename, mode = 'w+', dtype = np.float32, shape = self.shape)
         self.knns = [KNN(dim = dim, max_num_entries = max_memories, cap_num_entries = True) for _ in range(num_indices)]
-    
+
+        self.hashtable = TensorTokenTable(hashtable_filename)
+
         self.n_jobs = cpu_count() if multiprocessing else 1
 
     def set_scoped_indices(self, indices):
@@ -178,8 +215,10 @@ class KNNMemory():
             knn.reset()
 
         self.db_offsets[batch_indices] = 0
+        self.hashtable.reset()
 
-    def add(self, memories):
+
+    def add(self, memories, tokens):
         check_shape(memories, 'b n kv d', d = self.dim, kv = 2, b = len(self.scoped_indices))
 
         memories = memories.detach().cpu().numpy()
@@ -193,15 +232,15 @@ class KNNMemory():
         db_offsets = [self.db_offsets[i] for i in self.scoped_indices]
 
         # use joblib to insert new key / value memories into faiss index
-
-        @delayed
-        def knn_add(knn, key, db_offset):
+        def knn_add(knn, key, token, db_offset):
             knn.add(key, ids = knn_insert_ids + db_offset)
+            self.hashtable.add(key, token)
 
-        Parallel(n_jobs = self.n_jobs)(knn_add(*args) for args in zip(knns, keys, db_offsets))
+        Parallel(self.n_jobs)(
+            delayed(knn_add)(*args) for args in zip(knns, keys, tokens, db_offsets)
+        )
 
         # add the new memories to the memmap "database"
-
         add_indices = (rearrange(np.arange(num_memories), 'j -> 1 j') + rearrange(self.db_offsets[list(self.scoped_indices)], 'i -> i 1')) % self.max_memories
         self.db[rearrange(np.array(self.scoped_indices), 'i -> i 1'), add_indices] = memories
         self.db.flush()
@@ -255,7 +294,11 @@ class KNNMemory():
         all_key_values = rearrange_with_anon_dims(all_key_values, 'b (...p) ... -> b ...p ...', p = prec_dims)
         all_masks = rearrange_with_anon_dims(all_masks, 'b (...p) ... -> b ...p ...', p = prec_dims)
 
-        return all_key_values.to(device), all_masks.to(device)
+        tokens = []
+        for key in all_key_values:
+            tokens.append(self.hashtable.get(key))
+
+        return all_key_values.to(device), all_masks.to(device), tokens
 
     def __del__(self):
         if hasattr(self, 'knns'):
