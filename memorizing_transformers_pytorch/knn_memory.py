@@ -174,7 +174,8 @@ class KNNMemory():
         num_indices = 1,
         memmap_filename = './knn.memory.memmap',
         hashtable_filename = './knn.memory.hashtable',
-        multiprocessing = True
+        multiprocessing = True,
+        shared_indices=False,
     ):
         self.dim = dim
         self.num_indices = num_indices
@@ -185,9 +186,14 @@ class KNNMemory():
         self.db_offsets = np.zeros(num_indices, dtype = np.int32)
 
         self.db = np.memmap(memmap_filename, mode = 'w+', dtype = np.float32, shape = self.shape)
-        self.knns = [KNN(dim = dim, max_num_entries = max_memories, cap_num_entries = True) for _ in range(num_indices)]
 
-        self.hashtable = TensorTokenTable(hashtable_filename)
+        self.shared_indices = shared_indices
+        if not shared_indices:
+            self.knns = [KNN(dim = dim, max_num_entries = max_memories, cap_num_entries = True) for _ in range(num_indices)]
+        else:
+            self.knns = [KNN(dim=dim, max_num_entries=max_memories, cap_num_entries=True)]
+
+        # self.hashtable = TensorTokenTable(hashtable_filename)
 
         self.n_jobs = cpu_count() if multiprocessing else 1
 
@@ -218,7 +224,7 @@ class KNNMemory():
         self.hashtable.reset()
 
 
-    def add(self, memories, tokens):
+    def add(self, memories, tokens=None):
         check_shape(memories, 'b n kv d', d = self.dim, kv = 2, b = len(self.scoped_indices))
 
         memories = memories.detach().cpu().numpy()
@@ -234,8 +240,10 @@ class KNNMemory():
         # use joblib to insert new key / value memories into faiss index
         def knn_add(knn, key, token, db_offset):
             knn.add(key, ids = knn_insert_ids + db_offset)
-            self.hashtable.add(key, token)
+            # self.hashtable.add(key, token)
 
+        if tokens is None:
+            tokens = [None] * len(knns)
         Parallel(self.n_jobs)(
             delayed(knn_add)(*args) for args in zip(knns, keys, tokens, db_offsets)
         )
@@ -265,7 +273,10 @@ class KNNMemory():
         all_masks = []
         all_key_values = []
 
-        knns = [self.knns[i] for i in self.scoped_indices]
+        if self.shared_indices:
+            knns = [self.knns[0]] * len(self.scoped_indices)
+        else:
+            knns = [self.knns[i] for i in self.scoped_indices]
 
         # parallelize faiss search
 
@@ -294,9 +305,10 @@ class KNNMemory():
         all_key_values = rearrange_with_anon_dims(all_key_values, 'b (...p) ... -> b ...p ...', p = prec_dims)
         all_masks = rearrange_with_anon_dims(all_masks, 'b (...p) ... -> b ...p ...', p = prec_dims)
 
-        tokens = []
-        for key in all_key_values:
-            tokens.append(self.hashtable.get(key))
+        tokens = None
+        # tokens = []
+        # for key in all_key_values:
+        #     tokens.append(self.hashtable.get(key))
 
         return all_key_values.to(device), all_masks.to(device), tokens
 
